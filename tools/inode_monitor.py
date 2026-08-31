@@ -12,7 +12,11 @@ This script uses only Python standard library modules (no extra dependencies).
 """
 from __future__ import annotations
 
+import base64
 import configparser
+import hashlib
+import hmac
+import json
 import logging
 import os
 import signal
@@ -21,16 +25,23 @@ import socket
 import ssl
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from email.message import EmailMessage
 from typing import List
+from zoneinfo import ZoneInfo
 
 
 def load_config(path: str) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
-    read_files = cfg.read(path)
-    if not read_files:
-        raise FileNotFoundError(f"Config file not found: {path}")
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fp:
+            cfg.read_file(fp)
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Failed to read config {path!r}: {exc}") from exc
     return cfg
 
 
@@ -57,7 +68,8 @@ def send_email(cfg: configparser.ConfigParser, subject: str, body: str) -> None:
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
     msg["Subject"] = subject
-    msg.set_content(body)
+    msg.set_charset("utf-8")
+    msg.set_payload(body, charset="utf-8")
 
     try:
         if use_ssl:
@@ -79,10 +91,113 @@ def send_email(cfg: configparser.ConfigParser, subject: str, body: str) -> None:
         logging.exception("Failed to send email: %s", exc)
 
 
+def send_dingtalk(cfg: configparser.ConfigParser, subject: str, body: str) -> None:
+    dingtalk_cfg = cfg["dingtalk"]
+    webhook_url = dingtalk_cfg.get("webhook_url")
+    secret = dingtalk_cfg.get("secret", fallback="")
+    at_mobiles = parse_list(dingtalk_cfg.get("at_mobiles", fallback=""))
+    is_at_all = dingtalk_cfg.getboolean("is_at_all", fallback=False)
+
+    if not webhook_url:
+        logging.error("DingTalk not sent: webhook_url must be configured in the dingtalk section")
+        return
+
+    content = f"{subject}\n{body}"
+    payload = {
+        "msgtype": "text",
+        "text": {"content": content},
+        "at": {
+            "atMobiles": at_mobiles,
+            "isAtAll": is_at_all,
+        },
+    }
+
+    request_url = webhook_url
+    if secret:
+        timestamp = str(int(time.time() * 1000))
+        string_to_sign = f"{timestamp}\n{secret}"
+        hmac_code = hmac.new(secret.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).digest()
+        sign = urllib.parse.quote_plus(base64.b64encode(hmac_code).decode("utf-8"))
+        request_url = f"{webhook_url}&timestamp={timestamp}&sign={sign}"
+
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(request_url, data=data, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            response_body = resp.read().decode("utf-8")
+            logging.info("DingTalk notification sent: %s", response_body)
+    except Exception as exc:
+        logging.exception("Failed to send DingTalk notification: %s", exc)
+
+
+def send_wecom(cfg: configparser.ConfigParser, subject: str, body: str) -> None:
+    wecom_cfg = cfg["wecom"]
+    webhook_url = wecom_cfg.get("webhook_url")
+    mentioned_mobiles = parse_list(wecom_cfg.get("mentioned_mobiles", fallback=""))
+    mentioned_all = wecom_cfg.getboolean("mentioned_all", fallback=False)
+
+    if not webhook_url:
+        logging.error("WeCom not sent: webhook_url must be configured in the wecom section")
+        return
+
+    content = f"**{subject}**\n{body}"
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {"content": content},
+    }
+    if mentioned_mobiles:
+        payload["mentioned_mobile_list"] = mentioned_mobiles
+    if mentioned_all:
+        payload["mentioned_list"] = ["@all"]
+
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(webhook_url, data=data, headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            response_body = resp.read().decode("utf-8")
+            logging.info("WeCom notification sent: %s", response_body)
+    except Exception as exc:
+        logging.exception("Failed to send WeCom notification: %s", exc)
+
+
+def send_notification(cfg: configparser.ConfigParser, subject: str, body: str) -> None:
+    if cfg.has_section("notification"):
+        channel_value = cfg.get("notification", "channel", fallback="email")
+    else:
+        channel_value = "email"
+    channels = [part.strip().lower() for part in channel_value.split(",") if part.strip()]
+    if not channels:
+        channels = ["email"]
+    if "all" in channels:
+        channels = ["email", "dingtalk", "wecom"]
+
+    for channel in channels:
+        if channel == "dingtalk":
+            send_dingtalk(cfg, subject, body)
+            continue
+        if channel == "wecom":
+            send_wecom(cfg, subject, body)
+            continue
+        if channel == "email":
+            send_email(cfg, subject, body)
+            continue
+        logging.warning("Unknown notification channel '%s', defaulting to email", channel)
+        send_email(cfg, subject, body)
+
+
 def check_tcp(host: str, port: int, timeout: float) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
+    except Exception:
+        return False
+
+
+def check_http(url: str, timeout: float) -> bool:
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return 200 <= response.status < 400
     except Exception:
         return False
 
@@ -101,7 +216,9 @@ def setup_logging(cfg: configparser.ConfigParser) -> None:
     if logfile:
         handlers.append(logging.FileHandler(logfile))
 
-    logging.basicConfig(level=level, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=level, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    logging.Formatter.converter = lambda *args: datetime.now(ZoneInfo("Asia/Shanghai")).timetuple()
 
 
 def main(config_path: str) -> int:
@@ -109,18 +226,30 @@ def main(config_path: str) -> int:
     setup_logging(cfg)
 
     check_cfg = cfg["check"]
+    mode = check_cfg.get("mode", fallback="tcp").lower()
     host = check_cfg.get("host")
-    port = check_cfg.getint("port")
+    port = check_cfg.getint("port", fallback=0)
+    http_url = check_cfg.get("http_url", fallback=None)
     interval = check_cfg.getfloat("interval", fallback=30.0)
     timeout = check_cfg.getfloat("connect_timeout", fallback=5.0)
     failure_threshold = check_cfg.getint("failure_threshold", fallback=3)
     notify_recovery = check_cfg.getboolean("notify_recovery", fallback=True)
 
-    if not host or not port:
-        logging.error("check.host and check.port must be configured in the check section")
-        return 2
+    if mode == "http":
+        if not http_url:
+            logging.error("check.http_url must be configured when mode = http")
+            return 2
+    else:
+        if not host or not port:
+            logging.error("check.host and check.port must be configured in the check section")
+            return 2
 
-    subject_prefix = cfg["email"].get("subject_prefix", fallback="[iNode Monitor]")
+    if cfg.has_section("notification"):
+        subject_prefix = cfg.get("notification", "subject_prefix", fallback="[iNode Monitor]")
+    elif cfg.has_section("email"):
+        subject_prefix = cfg.get("email", "subject_prefix", fallback="[iNode Monitor]")
+    else:
+        subject_prefix = "[iNode Monitor]"
 
     consecutive_failures = 0
     notified = False
@@ -135,31 +264,38 @@ def main(config_path: str) -> int:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    logging.info("Starting iNode TCP monitor: %s:%s, interval=%ss, threshold=%s", host, port, interval, failure_threshold)
+    target_desc = f"{host}:{port}" if mode != "http" else http_url
+    logging.info("Starting iNode monitor in %s mode: %s, interval=%ss, threshold=%s", mode, target_desc, interval, failure_threshold)
 
     while running:
-        now = datetime.utcnow().isoformat() + "Z"
-        ok = check_tcp(host, port, timeout)
+        now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S %z")
+        if mode == "http":
+            ok = check_http(http_url, timeout)
+            target_label = http_url
+        else:
+            ok = check_tcp(host, port, timeout)
+            target_label = f"{host}:{port}"
+
         if ok:
             if consecutive_failures > 0:
-                logging.info("Connection restored to %s:%s (previous failures=%s)", host, port, consecutive_failures)
+                logging.info("Connection restored to %s (previous failures=%s)", target_label, consecutive_failures)
             consecutive_failures = 0
             if notified and notify_recovery:
-                subject = f"{subject_prefix} iNode client recovered: {host}:{port}"
-                body = f"iNode client at {host}:{port} is reachable again as of {now}."
-                send_email(cfg, subject, body)
+                subject = f"{subject_prefix} iNode client recovered: {target_label}"
+                body = f"iNode client at {target_label} is reachable again as of {now}."
+                send_notification(cfg, subject, body)
                 notified = False
         else:
             consecutive_failures += 1
-            logging.warning("Connection check failed for %s:%s (consecutive=%s)", host, port, consecutive_failures)
+            logging.warning("Connection check failed for %s (consecutive=%s)", target_label, consecutive_failures)
             if consecutive_failures >= failure_threshold and not notified:
-                subject = f"{subject_prefix} iNode client unreachable: {host}:{port}"
+                subject = f"{subject_prefix} iNode client unreachable: {target_label}"
                 body = (
-                    f"iNode client at {host}:{port} has been unreachable for {consecutive_failures} checks.\n"
+                    f"iNode client at {target_label} has been unreachable for {consecutive_failures} checks.\n"
                     f"Last checked: {now}\n"
                     f"Check interval: {interval}s; connect timeout: {timeout}s; failure threshold: {failure_threshold}\n"
                 )
-                send_email(cfg, subject, body)
+                send_notification(cfg, subject, body)
                 notified = True
 
         # Sleep with interruption support
