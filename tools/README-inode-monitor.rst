@@ -62,5 +62,8 @@ Example config:
 Notes:
 
 - The script uses only Python standard library modules: socket, smtplib, urllib, hmac, hashlib, json, configparser.
-- It performs TCP connect attempts; if you need ICMP ping or HTTP health-check, the script can be extended.
+- It can perform TCP connect attempts or HTTP health-checks (mode selection in [check]).
+- Log cleanup and simple process-monitoring (auto-restart) are available via configuration:
+  - [log_cleanup] controls a directory, glob pattern and keep_days for removing old logs
+  - [processes] maps a process name to a start command; monitor checks and restarts missing processes
 - For production use, run the script under a process supervisor (systemd, supervisor, or a container).

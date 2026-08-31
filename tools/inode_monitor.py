@@ -19,17 +19,21 @@ import hmac
 import json
 import logging
 import os
+import platform
 import signal
 import smtplib
 import socket
 import ssl
+import subprocess
 import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
+from pathlib import Path
 from typing import List
+from zoneinfo import ZoneInfo
 from zoneinfo import ZoneInfo
 
 
@@ -185,6 +189,100 @@ def send_notification(cfg: configparser.ConfigParser, subject: str, body: str) -
         send_email(cfg, subject, body)
 
 
+def cleanup_logs(cfg: configparser.ConfigParser) -> None:
+    """Remove log files older than configured days in the configured directory.
+
+    Config section: [log_cleanup]
+      directory = /var/log/inode_monitor
+      pattern = *.log        (glob pattern)
+      keep_days = 7
+      interval_hours = 24    (how often cleanup runs)
+    """
+    if not cfg.has_section("log_cleanup"):
+        return
+    sec = cfg["log_cleanup"]
+    directory = sec.get("directory", fallback=None)
+    if not directory:
+        logging.debug("log_cleanup configured but no directory set; skipping cleanup")
+        return
+    pattern = sec.get("pattern", fallback="*.log")
+    keep_days = sec.getint("keep_days", fallback=7)
+
+    try:
+        p = Path(directory)
+        if not p.exists() or not p.is_dir():
+            logging.warning("Log cleanup directory does not exist: %s", directory)
+            return
+        cutoff = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=keep_days)
+        removed = 0
+        for f in p.glob(pattern):
+            try:
+                if f.is_file():
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime, ZoneInfo("Asia/Shanghai"))
+                    if mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                        logging.info("Removed old log file: %s", str(f))
+            except Exception:
+                logging.exception("Failed to consider/remove log file: %s", f)
+        logging.info("Log cleanup completed in %s: removed %d files older than %d days", directory, removed, keep_days)
+    except Exception:
+        logging.exception("Error while performing log cleanup")
+
+
+def is_process_running(proc_name: str) -> bool:
+    """Check if a process with name or pattern proc_name is running.
+    On Windows use tasklist; on Unix use pgrep -f.
+    """
+    try:
+        if platform.system().lower() == "windows":
+            # tasklist output contains image names
+            out = subprocess.check_output(["tasklist", "/FI", f"IMAGENAME eq {proc_name}"], stderr=subprocess.DEVNULL, text=True)
+            return proc_name.lower() in out.lower()
+        else:
+            # Use pgrep -f to match by full command line
+            res = subprocess.run(["pgrep", "-f", proc_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return res.returncode == 0
+    except Exception:
+        logging.exception("Failed to check process %s", proc_name)
+        return False
+
+
+def start_process(start_cmd: str) -> None:
+    """Start a process using the configured command. Runs asynchronously (detached)."""
+    try:
+        # Use shell=True so the user can supply complex commands. Responsible operator must configure safely.
+        subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logging.info("Started process with command: %s", start_cmd)
+    except Exception:
+        logging.exception("Failed to start process: %s", start_cmd)
+
+
+def monitor_processes(cfg: configparser.ConfigParser) -> None:
+    """Check configured processes and start them if they're not running.
+
+    Config section: [processes]
+      name1 = start command for name1
+      name2 = start command for name2
+    """
+    if not cfg.has_section("processes"):
+        return
+    sec = cfg["processes"]
+    for proc_name, start_cmd in sec.items():
+        proc_name = proc_name.strip()
+        start_cmd = start_cmd.strip()
+        if not proc_name or not start_cmd:
+            continue
+        try:
+            if not is_process_running(proc_name):
+                logging.warning("Process '%s' not running; attempting restart via: %s", proc_name, start_cmd)
+                start_process(start_cmd)
+            else:
+                logging.debug("Process '%s' is running", proc_name)
+        except Exception:
+            logging.exception("Error while monitoring process %s", proc_name)
+
+
 def check_tcp(host: str, port: int, timeout: float) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -254,7 +352,27 @@ def main(config_path: str) -> int:
     consecutive_failures = 0
     notified = False
 
+    # Timers for periodic tasks
     running = True
+
+    # last cleanup and process-check timestamps
+    last_cleanup = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=1)
+    cleanup_interval_hours = cfg.get("log_cleanup", "interval_hours", fallback=None) if cfg.has_section("log_cleanup") else None
+    if cleanup_interval_hours is not None:
+        try:
+            cleanup_interval_hours = int(cleanup_interval_hours)
+        except Exception:
+            cleanup_interval_hours = 24
+
+    last_proc_check = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(seconds=60)
+    proc_check_interval = cfg.get("process_monitor", "check_interval_seconds", fallback=None) if cfg.has_section("process_monitor") else None
+    if proc_check_interval is not None:
+        try:
+            proc_check_interval = int(proc_check_interval)
+        except Exception:
+            proc_check_interval = 30
+    else:
+        proc_check_interval = 30
 
     def _signal_handler(signum, frame):
         nonlocal running
@@ -268,7 +386,28 @@ def main(config_path: str) -> int:
     logging.info("Starting iNode monitor in %s mode: %s, interval=%ss, threshold=%s", mode, target_desc, interval, failure_threshold)
 
     while running:
-        now = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S %z")
+        now_dt = datetime.now(ZoneInfo("Asia/Shanghai"))
+        now = now_dt.strftime("%Y-%m-%d %H:%M:%S %z")
+
+        # periodic cleanup
+        try:
+            if cleanup_interval_hours:
+                elapsed = (now_dt - last_cleanup).total_seconds() / 3600.0
+                if elapsed >= cleanup_interval_hours:
+                    cleanup_logs(cfg)
+                    last_cleanup = now_dt
+        except Exception:
+            logging.exception("Error during scheduled log cleanup")
+
+        # periodic process monitor
+        try:
+            elapsed_proc = (now_dt - last_proc_check).total_seconds()
+            if elapsed_proc >= proc_check_interval:
+                monitor_processes(cfg)
+                last_proc_check = now_dt
+        except Exception:
+            logging.exception("Error during process monitoring")
+
         if mode == "http":
             ok = check_http(http_url, timeout)
             target_label = http_url
