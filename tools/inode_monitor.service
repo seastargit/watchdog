@@ -1,0 +1,21 @@
+# inode_monitor systemd unit
+# Edit ExecStart and WorkingDirectory to point to the installed location of the repository or the virtualenv/python binary.
+[Unit]
+Description=iNode TCP Monitor
+After=network.target
+
+[Service]
+Type=simple
+# Example: run with system python3 and a config path in /etc/inode_monitor
+# ExecStart=/usr/bin/env python3 /opt/inode_monitor/tools/inode_monitor.py /opt/inode_monitor/tools/inode_monitor.ini
+# Adjust the paths below to match your installation
+ExecStart=/usr/bin/env python3 /opt/inode_monitor/tools/inode_monitor.py /opt/inode_monitor/tools/inode_monitor.ini
+WorkingDirectory=/opt/inode_monitor
+Restart=on-failure
+RestartSec=10
+# Replace 'inode-monitor' with an appropriate system user/group or remove to run as root
+User=inode-monitor
+Group=inode-monitor
+
+[Install]
+WantedBy=multi-user.target
