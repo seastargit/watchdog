@@ -238,34 +238,44 @@ def cleanup_logs(cfg: configparser.ConfigParser) -> None:
         logging.exception("Error while performing log cleanup")
 
 
-def is_process_running(proc_name: str) -> bool:
-    """Check if a process with name or pattern proc_name is running.
-    On Windows parse tasklist CSV and match image name without requiring extension.
-    On Unix use pgrep -f.
-    """
+def find_pids_by_name(proc_name: str) -> List[int]:
+    """Find PIDs matching proc_name. On Windows, match image name or base name. On Unix, use pgrep -f."""
+    pids: List[int] = []
     try:
         if platform.system().lower() == "windows":
-            # Use CSV output to reliably parse the Image Name column
             out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], stderr=subprocess.DEVNULL, text=True)
-            # Each line is a CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
             for row in csv.reader(out.splitlines()):
                 if not row:
                     continue
                 image = row[0].strip('"')
+                pid_str = row[1].strip('"') if len(row) > 1 else ""
+                try:
+                    pid = int(pid_str)
+                except Exception:
+                    continue
                 image_lower = image.lower()
-                # compare without extension if proc_name provided without extension
                 proc_lower = proc_name.lower()
                 image_base = os.path.splitext(image_lower)[0]
-                if proc_lower == image_lower or proc_lower == image_base:
-                    return True
-            return False
+                if proc_lower == image_lower or proc_lower == image_base or proc_lower in image_lower:
+                    pids.append(pid)
         else:
-            # Use pgrep -f to match by full command line
-            res = subprocess.run(["pgrep", "-f", proc_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return res.returncode == 0
+            out = subprocess.check_output(["pgrep", "-f", proc_name], stderr=subprocess.DEVNULL, text=True)
+            for line in out.splitlines():
+                try:
+                    pids.append(int(line.strip()))
+                except Exception:
+                    continue
+    except subprocess.CalledProcessError:
+        # pgrep returns non-zero when no process found; tasklist may still succeed
+        pass
     except Exception:
-        logging.exception("Failed to check process %s", proc_name)
-        return False
+        logging.exception("Failed to find PIDs for %s", proc_name)
+    return pids
+
+
+def is_process_running(proc_name: str) -> bool:
+    """Return True if any PID matches the given proc_name."""
+    return len(find_pids_by_name(proc_name)) > 0
 
 
 def start_process(start_cmd: str) -> None:
@@ -281,6 +291,7 @@ def start_process(start_cmd: str) -> None:
                 creationflags = subprocess.CREATE_NEW_CONSOLE
             except Exception:
                 creationflags = 0
+            # Use shell=True to allow complex commands and ensure new console
             subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
         else:
             # start_new_session detaches the child process on Unix-like systems
@@ -288,6 +299,79 @@ def start_process(start_cmd: str) -> None:
         logging.info("Started process with command: %s", start_cmd)
     except Exception:
         logging.exception("Failed to start process: %s", start_cmd)
+
+
+def stop_processes_by_name(proc_name: str) -> int:
+    """Stop all processes matching proc_name. Returns the number of processes terminated."""
+    terminated = 0
+    pids = find_pids_by_name(proc_name)
+    for pid in pids:
+        try:
+            if platform.system().lower() == "windows":
+                subprocess.check_call(["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.kill(pid, 15)
+            terminated += 1
+            logging.info("Terminated process %s (pid=%s)", proc_name, pid)
+        except Exception:
+            logging.exception("Failed to terminate pid %s for %s", pid, proc_name)
+    return terminated
+
+
+def start_processes_by_name(proc_name: str, start_cmds: str) -> int:
+    """Start processes corresponding to proc_name using a list of start commands.
+    start_cmds may be a single command or multiple commands separated by ';;' or ';' or '||'.
+    Returns the number of commands started.
+    """
+    if not start_cmds:
+        return 0
+    # split by common separators ; or || or ;; while preserving commands that may contain semicolons
+    parts = []
+    if '||' in start_cmds:
+        parts = [p.strip() for p in start_cmds.split('||') if p.strip()]
+    else:
+        parts = [p.strip() for p in start_cmds.split(';') if p.strip()]
+    started = 0
+    for cmd in parts:
+        start_process(cmd)
+        started += 1
+    return started
+
+
+def rename_file(src: str, dst: str, overwrite: bool = False) -> bool:
+    """Rename or move a file from src to dst.
+
+    If overwrite is True and dst exists, it will be replaced.
+    Returns True on success, False on failure.
+    """
+    try:
+        src_path = Path(src)
+        dst_path = Path(dst)
+        if not src_path.exists():
+            logging.warning("rename_file: source does not exist: %s", src)
+            return False
+        if dst_path.exists():
+            if overwrite:
+                if dst_path.is_file():
+                    dst_path.unlink()
+                else:
+                    logging.warning("rename_file: destination exists and is not a file: %s", dst)
+                    return False
+            else:
+                logging.warning("rename_file: destination exists and overwrite is False: %s", dst)
+                return False
+        try:
+            src_path.replace(dst_path)
+        except Exception:
+            # fallback to copy+unlink for cross-filesystem moves
+            import shutil
+            shutil.copy2(str(src_path), str(dst_path))
+            src_path.unlink()
+        logging.info("Renamed %s -> %s", src, dst)
+        return True
+    except Exception:
+        logging.exception("Failed to rename %s -> %s", src, dst)
+        return False
 
 
 def monitor_processes(cfg: configparser.ConfigParser) -> None:
