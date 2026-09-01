@@ -47,3 +47,4 @@ lib/
 /bootstrap.py
 venv/
 .venv/
+tools/inode_monitor -本地副本.ini
