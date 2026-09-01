@@ -291,11 +291,11 @@ def start_process(start_cmd: str) -> None:
                 creationflags = subprocess.CREATE_NEW_CONSOLE
             except Exception:
                 creationflags = 0
-            # Use shell=True to allow complex commands and ensure new console
-            subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+            # Use shell=False to allow complex commands and ensure new console
+            subprocess.Popen(start_cmd, shell=False, creationflags=creationflags)
         else:
             # start_new_session detaches the child process on Unix-like systems
-            subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            subprocess.Popen(start_cmd, shell=False, start_new_session=True)
         logging.info("Started process with command: %s", start_cmd)
     except Exception:
         logging.exception("Failed to start process: %s", start_cmd)
