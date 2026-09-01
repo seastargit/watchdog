@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import configparser
+import csv
 import hashlib
 import hmac
 import json
@@ -215,16 +216,23 @@ def cleanup_logs(cfg: configparser.ConfigParser) -> None:
             return
         cutoff = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=keep_days)
         removed = 0
-        for f in p.glob(pattern):
-            try:
-                if f.is_file():
-                    mtime = datetime.fromtimestamp(f.stat().st_mtime, ZoneInfo("Asia/Shanghai"))
-                    if mtime < cutoff:
-                        f.unlink()
-                        removed += 1
-                        logging.info("Removed old log file: %s", str(f))
-            except Exception:
-                logging.exception("Failed to consider/remove log file: %s", f)
+        # allow multiple patterns separated by comma or semicolon
+        pat_value = pattern.replace(";", ",")
+        patterns = [pat.strip() for pat in pat_value.split(",") if pat.strip()]
+        if not patterns:
+            patterns = ["*.log"]
+        for pat in patterns:
+            # rglob to recurse into subdirectories
+            for f in p.rglob(pat):
+                try:
+                    if f.is_file():
+                        mtime = datetime.fromtimestamp(f.stat().st_mtime, ZoneInfo("Asia/Shanghai"))
+                        if mtime < cutoff:
+                            f.unlink()
+                            removed += 1
+                            logging.info("Removed old log file: %s", str(f))
+                except Exception:
+                    logging.exception("Failed to consider/remove log file: %s", f)
         logging.info("Log cleanup completed in %s: removed %d files older than %d days", directory, removed, keep_days)
     except Exception:
         logging.exception("Error while performing log cleanup")
@@ -232,13 +240,25 @@ def cleanup_logs(cfg: configparser.ConfigParser) -> None:
 
 def is_process_running(proc_name: str) -> bool:
     """Check if a process with name or pattern proc_name is running.
-    On Windows use tasklist; on Unix use pgrep -f.
+    On Windows parse tasklist CSV and match image name without requiring extension.
+    On Unix use pgrep -f.
     """
     try:
         if platform.system().lower() == "windows":
-            # tasklist output contains image names
-            out = subprocess.check_output(["tasklist", "/FI", f"IMAGENAME eq {proc_name}"], stderr=subprocess.DEVNULL, text=True)
-            return proc_name.lower() in out.lower()
+            # Use CSV output to reliably parse the Image Name column
+            out = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], stderr=subprocess.DEVNULL, text=True)
+            # Each line is a CSV: "Image Name","PID","Session Name","Session#","Mem Usage"
+            for row in csv.reader(out.splitlines()):
+                if not row:
+                    continue
+                image = row[0].strip('"')
+                image_lower = image.lower()
+                # compare without extension if proc_name provided without extension
+                proc_lower = proc_name.lower()
+                image_base = os.path.splitext(image_lower)[0]
+                if proc_lower == image_lower or proc_lower == image_base:
+                    return True
+            return False
         else:
             # Use pgrep -f to match by full command line
             res = subprocess.run(["pgrep", "-f", proc_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -249,10 +269,22 @@ def is_process_running(proc_name: str) -> bool:
 
 
 def start_process(start_cmd: str) -> None:
-    """Start a process using the configured command. Runs asynchronously (detached)."""
+    """Start a process using the configured command. Runs asynchronously (detached).
+
+    On Windows open a new console window for console programs. On Unix use start_new_session to detach.
+    """
     try:
-        # Use shell=True so the user can supply complex commands. Responsible operator must configure safely.
-        subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if platform.system().lower() == "windows":
+            # CREATE_NEW_CONSOLE opens a new console window for the child process
+            creationflags = 0
+            try:
+                creationflags = subprocess.CREATE_NEW_CONSOLE
+            except Exception:
+                creationflags = 0
+            subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=creationflags)
+        else:
+            # start_new_session detaches the child process on Unix-like systems
+            subprocess.Popen(start_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         logging.info("Started process with command: %s", start_cmd)
     except Exception:
         logging.exception("Failed to start process: %s", start_cmd)
