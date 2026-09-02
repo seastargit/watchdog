@@ -48,3 +48,4 @@ lib/
 venv/
 .venv/
 tools/inode_monitor -本地副本.ini
+tools/inode_monitor.ini
