@@ -480,7 +480,6 @@ def main(config_path: str) -> int:
         except Exception:
             cleanup_interval_hours = 24
 
-    last_proc_check = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(seconds=60)
     proc_check_interval = cfg.get("process_monitor", "check_interval_seconds", fallback=None) if cfg.has_section("process_monitor") else None
     if proc_check_interval is not None:
         try:
@@ -489,6 +488,12 @@ def main(config_path: str) -> int:
             proc_check_interval = 30
     else:
         proc_check_interval = 30
+    if proc_check_interval <= 0:
+        proc_check_interval = 30
+
+    # Use separate deadlines so process monitoring is independent from the global monitor interval.
+    next_proc_check = datetime.now(ZoneInfo("Asia/Shanghai"))
+    next_conn_check = datetime.now(ZoneInfo("Asia/Shanghai"))
 
     def _signal_handler(signum, frame):
         nonlocal running
@@ -515,50 +520,50 @@ def main(config_path: str) -> int:
         except Exception:
             logging.exception("Error during scheduled log cleanup")
 
-        # periodic process monitor
+        # periodic process monitor runs on its own interval and is not tied to the network check interval
         try:
-            elapsed_proc = (now_dt - last_proc_check).total_seconds()
-            if elapsed_proc >= proc_check_interval:
+            if now_dt >= next_proc_check:
                 monitor_processes(cfg)
-                last_proc_check = now_dt
+                while next_proc_check <= now_dt:
+                    next_proc_check += timedelta(seconds=proc_check_interval)
         except Exception:
             logging.exception("Error during process monitoring")
 
-        if mode == "http":
-            ok = check_http(http_url, timeout)
-            target_label = http_url
-        else:
-            ok = check_tcp(host, port, timeout)
-            target_label = f"{host}:{port}"
+        if now_dt >= next_conn_check:
+            if mode == "http":
+                ok = check_http(http_url, timeout)
+                target_label = http_url
+            else:
+                ok = check_tcp(host, port, timeout)
+                target_label = f"{host}:{port}"
+            check_status = "连接成功(恢复)" if ok else "连接断开（或异常）"
+            if ok:
+                if consecutive_failures > 0:
+                    logging.info("Connection restored to %s (previous failures=%s)", target_label, consecutive_failures)
+                consecutive_failures = 0
+                if notified and notify_recovery:
+                    subject = f"{subject_prefix} {check_status}， iNode client recovered: {target_label}"
+                    body = f"iNode client at {target_label} is reachable again as of {now}."
+                    send_notification(cfg, subject, body)
+                    notified = False
+            else:
+                consecutive_failures += 1
+                logging.warning("Connection check failed for %s (consecutive=%s)", target_label, consecutive_failures)
+                if consecutive_failures >= failure_threshold and not notified:
+                    subject = f"{subject_prefix} {check_status}， iNode client unreachable: {target_label}"
+                    body = (
+                        f"iNode client at {target_label} has been unreachable for {consecutive_failures} checks.\n"
+                        f"Last checked: {now}\n"
+                        f"Check interval: {interval}s; connect timeout: {timeout}s; failure threshold: {failure_threshold}\n"
+                    )
+                    send_notification(cfg, subject, body)
+                    notified = True
+            while next_conn_check <= now_dt:
+                next_conn_check += timedelta(seconds=interval)
 
-        if ok:
-            if consecutive_failures > 0:
-                logging.info("Connection restored to %s (previous failures=%s)", target_label, consecutive_failures)
-            consecutive_failures = 0
-            if notified and notify_recovery:
-                subject = f"{subject_prefix} iNode client recovered: {target_label}"
-                body = f"iNode client at {target_label} is reachable again as of {now}."
-                send_notification(cfg, subject, body)
-                notified = False
-        else:
-            consecutive_failures += 1
-            logging.warning("Connection check failed for %s (consecutive=%s)", target_label, consecutive_failures)
-            if consecutive_failures >= failure_threshold and not notified:
-                subject = f"{subject_prefix} iNode client unreachable: {target_label}"
-                body = (
-                    f"iNode client at {target_label} has been unreachable for {consecutive_failures} checks.\n"
-                    f"Last checked: {now}\n"
-                    f"Check interval: {interval}s; connect timeout: {timeout}s; failure threshold: {failure_threshold}\n"
-                )
-                send_notification(cfg, subject, body)
-                notified = True
-
-        # Sleep with interruption support
-        slept = 0.0
-        while running and slept < interval:
-            step = min(1.0, interval - slept)
-            time.sleep(step)
-            slept += step
+        next_event = min(next_proc_check, next_conn_check)
+        sleep_for = max(0.2, (next_event - datetime.now(ZoneInfo("Asia/Shanghai"))).total_seconds())
+        time.sleep(sleep_for)
 
     logging.info("Monitor stopped")
     return 0
