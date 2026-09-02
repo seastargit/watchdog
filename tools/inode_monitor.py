@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import configparser
+import threading
 import csv
 import hashlib
 import hmac
@@ -32,11 +33,21 @@ import sys
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from typing import List
-from zoneinfo import ZoneInfo
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python 3.8 compatibility
+    ZoneInfo = None
+
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo is not None else timezone(timedelta(hours=8))
+
+
+def now_in_china() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
 
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -230,7 +241,7 @@ class LogCleaner:
                 logging.warning("Log cleanup directory does not exist: %s", directory)
                 return
 
-            cutoff = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=keep_days)
+            cutoff = now_in_china() - timedelta(days=keep_days)
             removed = 0
             pat_value = pattern.replace(";", ",")
             patterns = [pat.strip() for pat in pat_value.split(",") if pat.strip()]
@@ -241,7 +252,7 @@ class LogCleaner:
                 for f in root.rglob(pat):
                     try:
                         if f.is_file():
-                            mtime = datetime.fromtimestamp(f.stat().st_mtime, ZoneInfo("Asia/Shanghai"))
+                            mtime = datetime.fromtimestamp(f.stat().st_mtime, SHANGHAI_TZ)
                             if mtime < cutoff:
                                 f.unlink()
                                 removed += 1
@@ -421,12 +432,14 @@ def setup_logging(cfg: configparser.ConfigParser) -> None:
         handlers.append(logging.FileHandler(logfile))
 
     logging.basicConfig(level=level, handlers=handlers, format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    logging.Formatter.converter = lambda *args: datetime.now(ZoneInfo("Asia/Shanghai")).timetuple()
+    logging.Formatter.converter = lambda *args: now_in_china().timetuple()
 
 
 class MonitorController:
     def __init__(self, config_path: str):
         self.cfg = load_config(config_path)
+        self.service_mode = False
+        self.stop_event = threading.Event()
         setup_logging(self.cfg)
 
         self.check_cfg = self.cfg["check"]
@@ -462,7 +475,7 @@ class MonitorController:
         self.notified = False
         self.running = True
 
-        self.last_cleanup = datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=1)
+        self.last_cleanup = now_in_china() - timedelta(days=1)
         self.cleanup_interval_hours = self.cfg.get("log_cleanup", "interval_hours", fallback=None) if self.cfg.has_section("log_cleanup") else None
         if self.cleanup_interval_hours is not None:
             try:
@@ -481,13 +494,14 @@ class MonitorController:
         if self.proc_check_interval <= 0:
             self.proc_check_interval = 30
 
-        self.next_proc_check = datetime.now(ZoneInfo("Asia/Shanghai"))
-        self.next_conn_check = datetime.now(ZoneInfo("Asia/Shanghai"))
+        self.next_proc_check = now_in_china()
+        self.next_conn_check = now_in_china()
         self.target_desc = f"{self.host}:{self.port}" if self.mode != "http" else self.http_url
 
     def _handle_signal(self, signum, frame):
         logging.info("Received signal %s, shutting down...", signum)
         self.running = False
+        self.stop_event.set()
 
     def _check_once(self, now: str) -> None:
         if self.mode == "http":
@@ -522,8 +536,14 @@ class MonitorController:
             self.notified = True
 
     def run(self) -> int:
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        if self.service_mode and platform.system().lower() == "windows":
+            logging.info("Service mode enabled; monitoring loop will keep running as a Windows service-friendly process.")
+        else:
+            try:
+                signal.signal(signal.SIGINT, self._handle_signal)
+                signal.signal(signal.SIGTERM, self._handle_signal)
+            except (AttributeError, ValueError):
+                logging.debug("Signal handlers are unavailable in this runtime; continuing without them.")
 
         logging.info(
             "Starting iNode monitor in %s mode: %s, interval=%ss, threshold=%s",
@@ -534,7 +554,7 @@ class MonitorController:
         )
 
         while self.running:
-            now_dt = datetime.now(ZoneInfo("Asia/Shanghai"))
+            now_dt = now_in_china()
             now_ts = now_dt.strftime("%Y-%m-%d %H:%M:%S %z")
 
             try:
@@ -560,16 +580,23 @@ class MonitorController:
                     self.next_conn_check += timedelta(seconds=self.interval)
 
             next_event = min(self.next_proc_check, self.next_conn_check)
-            sleep_for = max(0.2, (next_event - datetime.now(ZoneInfo("Asia/Shanghai"))).total_seconds())
-            time.sleep(sleep_for)
+            sleep_for = max(0.2, (next_event - now_in_china()).total_seconds())
+            if self.service_mode:
+                self.stop_event.wait(timeout=min(1.0, sleep_for if sleep_for > 0 else 1.0))
+                if self.stop_event.is_set():
+                    self.running = False
+            else:
+                time.sleep(sleep_for)
 
         logging.info("Monitor stopped")
         return 0
 
 
-def main(config_path: str) -> int:
+def main(config_path: str, service_mode: bool = False) -> int:
     try:
-        return MonitorController(config_path).run()
+        controller = MonitorController(config_path)
+        controller.service_mode = service_mode
+        return controller.run()
     except FileNotFoundError as exc:
         print(exc, file=sys.stderr)
         return 2

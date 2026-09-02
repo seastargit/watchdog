@@ -17,7 +17,7 @@ if errorlevel 1 (
 set "SERVICE_NAME=INodeMonitor"
 set "DISPLAY_NAME=iNode Monitor"
 
-nssm install "%SERVICE_NAME%" "%PYTHON_EXE%" "%SCRIPT_DIR%run_inode_monitor.py" "%CONFIG_PATH%"
+nssm install "%SERVICE_NAME%" "%PYTHON_EXE%" "%SCRIPT_DIR%run_inode_monitor.py" --service "%CONFIG_PATH%"
 nssm set "%SERVICE_NAME%" AppDirectory "%SCRIPT_DIR%"
 nssm set "%SERVICE_NAME%" DisplayName "%DISPLAY_NAME%"
 nssm set "%SERVICE_NAME%" Start SERVICE_AUTO_START
