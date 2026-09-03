@@ -179,6 +179,7 @@ class NotificationService:
             payload["mentioned_mobile_list"] = mentioned_mobiles
         if mentioned_all:
             payload["mentioned_list"] = ["@all"]
+            payload["mentioned_mobile_list"] = ["@all"]
 
         try:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
